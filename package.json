@@ -10,9 +10,11 @@
     "package": "plasmo package"
   },
   "dependencies": {
+    "@plasmohq/storage": "^1.15.0",
     "plasmo": "0.90.5",
     "react": "18.2.0",
-    "react-dom": "18.2.0"
+    "react-dom": "18.2.0",
+    "sharp": "^0.34.3"
   },
   "devDependencies": {
     "@ianvs/prettier-plugin-sort-imports": "4.1.1",
@@ -24,8 +26,21 @@
     "typescript": "5.3.3"
   },
   "manifest": {
+    "manifest_version": 3,
     "host_permissions": [
       "https://*/*"
+    ],
+    "permissions": [
+      "tabCapture",
+      "activeTab",
+      "downloads",
+      "storage",
+      "notifications"
     ]
+  },
+  "plasmo": {
+    "contentScripts": {
+      "matches": ["*://*.youtube.com/*"]
+    }
   }
 }
