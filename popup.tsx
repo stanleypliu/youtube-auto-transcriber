@@ -9,6 +9,7 @@ function IndexPopup() {
   const [chunksProcessed, setChunksProcessed] = useState(0)
   const [lastActivity, setLastActivity] = useState("")
   const [isLoading, setIsLoading] = useState(false)
+  const [recordingMessage, setRecordingMessage] = useState("")
 
   const saveApiKey = () => {
     if (apiKey.trim()) {
@@ -65,6 +66,7 @@ function IndexPopup() {
           setRecordingDuration(0)
           setChunksProcessed(0)
           setLastActivity("Recording stopped")
+          setRecordingMessage("")
         }
       } else if (message.type === 'chunkProcessed') {
         setChunksProcessed(prev => prev + 1)
@@ -74,6 +76,7 @@ function IndexPopup() {
       } else if (message.type === 'recordingError') {
         setLastActivity(`Error: ${message.error}`)
         setIsRecording(false)
+        setRecordingMessage("")
       }
     }
 
@@ -107,7 +110,7 @@ function IndexPopup() {
     return `${mins}:${secs.toString().padStart(2, '0')}`
   }
 
-  const toggleRecording = () => {
+  const toggleRecording = async () => {
     setIsLoading(true)
     console.log('Toggle recording clicked, current state:', isRecording)
     
@@ -116,7 +119,15 @@ function IndexPopup() {
       chrome.runtime.sendMessage({ type: 'stopRecording' })
     } else {
       console.log('Sending startRecording message')
-      chrome.runtime.sendMessage({ type: 'startRecording' })
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'startRecording' })
+        if (response.success && response.message) {
+          setRecordingMessage(response.message)
+        }
+      } catch (error) {
+        console.error('Failed to start recording:', error)
+        setRecordingMessage('Failed to start recording')
+      }
     }
     
     // Reset loading state after a short delay
@@ -242,6 +253,20 @@ function IndexPopup() {
         {isRecording && (
           <div style={{ fontSize: '14px', marginBottom: '8px' }}>
             Duration: <strong>{formatDuration(recordingDuration)}</strong>
+          </div>
+        )}
+        
+        {recordingMessage && (
+          <div style={{ 
+            fontSize: '12px', 
+            color: '#1a73e8', 
+            marginBottom: '8px',
+            padding: '6px',
+            background: '#e8f0fe',
+            borderRadius: '4px',
+            border: '1px solid #dadce0'
+          }}>
+            📍 {recordingMessage}
           </div>
         )}
         
