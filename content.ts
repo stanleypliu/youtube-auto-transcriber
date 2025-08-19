@@ -1,5 +1,12 @@
 console.log('YouTube Auto Transcriber content script loaded')
 
+// Add more debugging to verify script is working
+console.log('Content script environment check:')
+console.log('- Window location:', window.location.href)
+console.log('- Document ready state:', document.readyState)
+console.log('- Chrome runtime available:', typeof chrome !== 'undefined' && !!chrome.runtime)
+console.log('- Content script timestamp:', new Date().toISOString())
+
 let recordingIndicator: HTMLElement | null = null
 let mediaRecorder: MediaRecorder | null = null
 let audioStream: MediaStream | null = null
@@ -16,37 +23,49 @@ function blobToBase64(blob: Blob): Promise<string> {
 
 // Listen for messages from background script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  console.log('=== CONTENT SCRIPT MESSAGE RECEIVED ===')
   console.log('Content script received message:', message)
+  console.log('Sender:', sender)
+  console.log('Message type:', message.type)
   
   if (message.type === 'ping') {
+    console.log('Responding to ping')
     sendResponse({ success: true, message: 'Content script is ready' })
   } else if (message.type === 'recordingState') {
+    console.log('Updating recording indicator:', message.isRecording)
     updateRecordingIndicator(message.isRecording)
     sendResponse({ success: true })
   } else if (message.type === 'startRecording') {
-    console.log('Starting screen capture recording...')
+    console.log('🎬 START RECORDING MESSAGE RECEIVED - Starting screen capture...')
     startScreenCapture()
     sendResponse({ success: true })
   } else if (message.type === 'stopRecording') {
-    console.log('Stopping screen capture recording...')
+    console.log('⏹️ STOP RECORDING MESSAGE RECEIVED - Stopping screen capture...')
     stopScreenCapture()
     sendResponse({ success: true })
   } else if (message.type === 'getRecordingState') {
     const isRecording = mediaRecorder?.state === 'recording'
+    console.log('Getting recording state:', isRecording)
     sendResponse({ isRecording })
+  } else {
+    console.log('❌ Unknown message type:', message.type)
   }
   
+  console.log('=== END MESSAGE HANDLING ===')
   return true
 })
 
 async function startScreenCapture() {
   try {
+    console.log('🎬 === STARTING SCREEN CAPTURE ===')
     console.log('Requesting screen capture with audio...')
     
     // Show instruction to user
     showInstructionModal()
+    console.log('Instruction modal shown')
     
     // Use getDisplayMedia to capture screen with audio
+    console.log('Calling navigator.mediaDevices.getDisplayMedia...')
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: true,  // Required for getDisplayMedia
       audio: {
@@ -57,7 +76,8 @@ async function startScreenCapture() {
       }
     })
     
-    console.log('Screen capture successful, tracks:', stream.getTracks().map(t => ({ 
+    console.log('✅ Screen capture successful!')
+    console.log('Stream tracks:', stream.getTracks().map(t => ({ 
       kind: t.kind, 
       enabled: t.enabled, 
       label: t.label,
@@ -68,8 +88,8 @@ async function startScreenCapture() {
     const audioTracks = stream.getAudioTracks()
     const videoTracks = stream.getVideoTracks()
     
-    console.log('Audio tracks:', audioTracks.length)
-    console.log('Video tracks:', videoTracks.length)
+    console.log(`Audio tracks found: ${audioTracks.length}`)
+    console.log(`Video tracks found: ${videoTracks.length}`)
     
     if (audioTracks.length === 0) {
       throw new Error('No audio captured. Please make sure to check "Share tab audio" when prompted.')
@@ -83,9 +103,11 @@ async function startScreenCapture() {
     
     // Create audio-only stream
     const audioOnlyStream = new MediaStream(audioTracks)
+    console.log('Created audio-only stream from', audioTracks.length, 'audio tracks')
     
     // Set up audio analysis
     try {
+      console.log('Setting up audio context...')
       audioContext = new AudioContext({ sampleRate: 44100 })
       const source = audioContext.createMediaStreamSource(audioOnlyStream)
       analyser = audioContext.createAnalyser()
@@ -95,27 +117,23 @@ async function startScreenCapture() {
       // Start monitoring audio levels
       monitorAudioLevels()
       
-      console.log('Audio context created, sample rate:', audioContext.sampleRate)
+      console.log('✅ Audio context created successfully, sample rate:', audioContext.sampleRate)
     } catch (error) {
-      console.error('Failed to create audio context:', error)
+      console.error('❌ Failed to create audio context:', error)
     }
     
-    // Try different audio formats, prioritizing ones easier to decode
+    // Use a more explicit WebM configuration that's compatible with Google Speech API
+    console.log('Configuring MediaRecorder for WebM audio...')
+    
+    // Check what formats are supported
     const supportedTypes = [
-      'audio/wav', // Try WAV first (easier to decode)
-      'audio/webm;codecs=pcm', // PCM in WebM container
-      'audio/ogg;codecs=opus', // Ogg container might work better
-      'audio/mp4', // MP4 container
-      'audio/webm;codecs=opus', // WebM with Opus as fallback
-      'audio/webm' // Generic WebM
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/webm;codecs=vorbis'
     ]
     
-    // Log which types are supported
-    supportedTypes.forEach(type => {
-      console.log(`${type}: ${MediaRecorder.isTypeSupported(type) ? 'SUPPORTED' : 'NOT SUPPORTED'}`)
-    })
-    
     let selectedType = supportedTypes.find(type => MediaRecorder.isTypeSupported(type))
+    console.log('Supported audio types:', supportedTypes.map(type => `${type}: ${MediaRecorder.isTypeSupported(type) ? 'YES' : 'NO'}`))
     console.log('Selected audio type:', selectedType)
     
     const options: MediaRecorderOptions = {
@@ -128,47 +146,49 @@ async function startScreenCapture() {
     
     console.log('MediaRecorder options:', options)
     
+    console.log('Creating MediaRecorder with audio stream...')
     mediaRecorder = new MediaRecorder(audioOnlyStream, options)
+    console.log('✅ MediaRecorder created successfully')
     
     mediaRecorder.ondataavailable = async (event) => {
+      console.log(`🎵 === MEDIARECORDER DATA AVAILABLE ===`)
+      console.log(`Event data size: ${event.data.size} bytes`)
+      console.log(`Event data type: ${event.data.type}`)
+      console.log(`Event timestamp: ${event.timeStamp}`)
+      
       if (event.data.size > 0) {
-        console.log(`Audio chunk available: ${event.data.size} bytes, type: ${event.data.type}`)
+        console.log(`=== AUDIO CHUNK CAPTURED ===`)
+        console.log(`Audio chunk available: ${event.data.size} bytes`)
+        console.log(`Audio chunk type: ${event.data.type}`)
+        console.log(`Audio chunk timestamp: ${event.timeStamp}`)
         
         try {
-          // First, try to convert to LINEAR16 PCM
-          const linear16Data = await convertBlobToLinear16(event.data)
+          // Don't try to convert to LINEAR16 - just send the original WebM data
+          // This avoids the decoding errors entirely
+          console.log('Converting blob to base64...')
+          const base64Data = await blobToBase64(event.data)
           
-          if (linear16Data) {
-            console.log(`Successfully converted to LINEAR16: ${linear16Data.length} characters (base64)`)
-            
-            // Send LINEAR16 data to background script
-            chrome.runtime.sendMessage({
-              type: 'audioChunk',
-              audioData: linear16Data,
-              size: event.data.size,
-              mimeType: 'audio/linear16',
-              encoding: 'LINEAR16',
-              sampleRate: audioContext?.sampleRate || 44100
-            })
-          } else {
-            console.log('LINEAR16 conversion failed, sending original blob as fallback')
-            
-            // Fallback: send the original blob
-            const base64Data = await blobToBase64(event.data)
-            chrome.runtime.sendMessage({
-              type: 'audioChunk',
-              audioData: base64Data,
-              size: event.data.size,
-              mimeType: event.data.type,
-              encoding: 'WEBM_OPUS'
-            })
-          }
+          console.log(`Converted to base64: ${base64Data.length} characters`)
+          console.log(`Base64 preview: ${base64Data.substring(0, 100)}...`)
+          
+          console.log('Sending audio chunk to background script...')
+          chrome.runtime.sendMessage({
+            type: 'audioChunk',
+            audioData: base64Data,
+            size: event.data.size,
+            mimeType: event.data.type,
+            encoding: 'WEBM_ORIGINAL',
+            sampleRate: audioContext?.sampleRate || 44100
+          })
+          
+          console.log(`✅ Audio chunk sent to background script`)
           
         } catch (error) {
-          console.error('Failed to process audio chunk:', error)
+          console.error('❌ Failed to process audio chunk:', error)
           
           // Last resort: try sending the original blob
           try {
+            console.log('Trying fallback approach...')
             const base64Data = await blobToBase64(event.data)
             chrome.runtime.sendMessage({
               type: 'audioChunk',
@@ -177,17 +197,20 @@ async function startScreenCapture() {
               mimeType: event.data.type,
               encoding: 'ORIGINAL'
             })
+            console.log('Fallback audio chunk sent')
           } catch (fallbackError) {
-            console.error('Even fallback failed:', fallbackError)
+            console.error('❌ Even fallback failed:', fallbackError)
           }
         }
+        console.log(`=== END AUDIO CHUNK ===`)
       } else {
-        console.warn('Received empty audio chunk')
+        console.warn('⚠️ Received empty audio chunk')
       }
+      console.log(`🎵 === END MEDIARECORDER DATA ===`)
     }
     
     mediaRecorder.onerror = (event) => {
-      console.error('MediaRecorder error:', event)
+      console.error('❌ MediaRecorder error:', event)
       chrome.runtime.sendMessage({
         type: 'recordingError',
         error: 'MediaRecorder error occurred'
@@ -195,26 +218,33 @@ async function startScreenCapture() {
     }
     
     mediaRecorder.onstop = () => {
-      console.log('MediaRecorder stopped')
+      console.log('⏹️ MediaRecorder stopped')
     }
     
     mediaRecorder.onstart = () => {
-      console.log('MediaRecorder started successfully')
+      console.log('✅ MediaRecorder started successfully')
     }
     
     // Start recording in 10-second chunks
-    console.log('Starting MediaRecorder...')
+    console.log('🎬 Starting MediaRecorder with 10-second chunks...')
     mediaRecorder.start(10000)
+    console.log('✅ MediaRecorder.start() called')
+    
     audioStream = stream
+    console.log('Audio stream saved')
     
     // Stop video tracks to save resources (we only need audio)
     videoTracks.forEach(track => track.stop())
+    console.log('Video tracks stopped')
     
     // Hide instruction modal
     hideInstructionModal()
+    console.log('Instruction modal hidden')
     
+    console.log('🎉 === SCREEN CAPTURE SETUP COMPLETE ===')
     console.log('Audio recording started successfully')
     chrome.runtime.sendMessage({ type: 'recordingStarted' })
+    console.log('recordingStarted message sent to background')
     
     // Handle stream end (user stops sharing)
     audioTracks.forEach(track => {
@@ -240,134 +270,6 @@ async function startScreenCapture() {
       error: errorMessage
     })
   }
-}
-
-async function convertBlobToLinear16(blob: Blob): Promise<string | null> {
-  try {
-    if (!audioContext) {
-      console.error('No audio context available for conversion')
-      return null
-    }
-    
-    console.log(`Converting blob to LINEAR16: ${blob.size} bytes, type: ${blob.type}`)
-    
-    // Convert blob to array buffer
-    const arrayBuffer = await blob.arrayBuffer()
-    console.log(`Array buffer size: ${arrayBuffer.byteLength} bytes`)
-    
-    // Try different approaches based on the blob type
-    let audioBuffer: AudioBuffer
-    
-    if (blob.type.includes('wav')) {
-      console.log('Attempting to decode WAV audio...')
-      audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0))
-    } else if (blob.type.includes('webm') || blob.type.includes('opus')) {
-      console.log('Attempting to decode WebM/Opus audio...')
-      try {
-        audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0))
-      } catch (webmError) {
-        console.error('WebM/Opus decoding failed:', webmError)
-        
-        // Try a workaround: create a temporary audio element
-        console.log('Trying audio element workaround...')
-        return await convertUsingAudioElement(blob)
-      }
-    } else {
-      console.log('Attempting to decode unknown audio format...')
-      audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0))
-    }
-    
-    console.log(`Decoded audio: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.numberOfChannels} channels, ${audioBuffer.sampleRate}Hz`)
-    
-    // Get the raw PCM data from the first channel
-    const channelData = audioBuffer.getChannelData(0)
-    
-    // Check for silence
-    const rms = Math.sqrt(channelData.reduce((sum, sample) => sum + sample * sample, 0) / channelData.length)
-    console.log(`Audio RMS level: ${rms.toFixed(6)} ${rms < 0.001 ? '(likely silent)' : '(has audio signal)'}`)
-    
-    if (rms < 0.001) {
-      console.warn('Audio appears to be silent, but proceeding with conversion anyway')
-    }
-    
-    // Convert float32 samples to int16 (LINEAR16 format)
-    const int16Data = new Int16Array(channelData.length)
-    for (let i = 0; i < channelData.length; i++) {
-      // Convert from [-1, 1] float to [-32768, 32767] int16
-      const sample = Math.max(-1, Math.min(1, channelData[i]))
-      int16Data[i] = sample < 0 ? sample * 32768 : sample * 32767
-    }
-    
-    console.log(`Converted ${channelData.length} samples to int16`)
-    
-    // Convert to base64
-    const uint8Array = new Uint8Array(int16Data.buffer)
-    let binary = ''
-    for (let i = 0; i < uint8Array.byteLength; i++) {
-      binary += String.fromCharCode(uint8Array[i])
-    }
-    
-    const base64 = btoa(binary)
-    console.log(`Generated base64 string: ${base64.length} characters`)
-    
-    return base64
-    
-  } catch (error) {
-    console.error('Failed to convert blob to LINEAR16:', error)
-    return null
-  }
-}
-
-async function convertUsingAudioElement(blob: Blob): Promise<string | null> {
-  return new Promise((resolve) => {
-    try {
-      console.log('Trying audio element approach...')
-      
-      const audio = new Audio()
-      const url = URL.createObjectURL(blob)
-      
-      audio.onloadeddata = async () => {
-        try {
-          console.log(`Audio element loaded: duration=${audio.duration}s`)
-          
-          if (!audioContext) {
-            resolve(null)
-            return
-          }
-          
-          // Create a media element source
-          const source = audioContext.createMediaElementSource(audio)
-          
-          // Create a destination to capture the audio
-          const destination = audioContext.createMediaStreamDestination()
-          source.connect(destination)
-          
-          // This approach is complex and may not work reliably
-          // For now, just return null to fall back to original format
-          console.log('Audio element approach is complex, falling back to original format')
-          resolve(null)
-          
-        } catch (error) {
-          console.error('Audio element processing failed:', error)
-          resolve(null)
-        } finally {
-          URL.revokeObjectURL(url)
-        }
-      }
-      
-      audio.onerror = (error) => {
-        console.error('Audio element failed to load:', error)
-        URL.revokeObjectURL(url)
-        resolve(null)
-      }
-      
-      audio.src = url
-      
-    } catch (error) {
-      console.error('Audio element approach failed:', error)
-      resolve(null)
-    }
-  })
 }
 
 function monitorAudioLevels() {
