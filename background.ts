@@ -13,9 +13,12 @@ interface TranscriptionEntry {
 class UniversalTranscriptionService {
   private isRecording = false
   private mediaRecorder: MediaRecorder | null = null
-  private transcriptionData: TranscriptionEntry[] = []
-  private sessionStartTime: number | null = null
+  private audioBuffer: Blob[] = []
+  private isProcessing = false
   private chunkCount = 0
+  private transcriptionData: TranscriptionEntry[] = []
+  private recordingStartTime: number = 0
+  private lastChunkTime: number = 0
   private currentTabId: number | null = null
 
   // Public getter to check recording state
@@ -98,7 +101,7 @@ class UniversalTranscriptionService {
         throw new Error('Content script is not reachable. Please refresh the YouTube page and try again.')
       }
       
-      this.sessionStartTime = Date.now()
+      this.recordingStartTime = Date.now()
       this.isRecording = true
       this.transcriptionData = []
       this.chunkCount = 0
@@ -155,6 +158,25 @@ class UniversalTranscriptionService {
       chrome.tabs.sendMessage(tabId, message, (response) => {
         if (chrome.runtime.lastError) {
           console.log('Failed to send message to tab:', chrome.runtime.lastError.message)
+          
+          // If it's a connection error, the content script might have been reloaded
+          if (chrome.runtime.lastError.message.includes('Receiving end does not exist')) {
+            console.log('Content script connection lost. This usually means:')
+            console.log('- The YouTube page was refreshed')
+            console.log('- The user navigated to a different page')
+            console.log('- The content script was reloaded')
+            
+            // Try to re-establish connection by checking if tab still exists
+            chrome.tabs.get(tabId, (tab) => {
+              if (chrome.runtime.lastError) {
+                console.log('Tab no longer exists, stopping recording')
+                this.stopRecording()
+              } else if (tab.url?.includes('youtube.com')) {
+                console.log('Tab still exists, content script may need to be re-injected')
+                // The content script should re-inject itself on page load
+              }
+            })
+          }
         }
       })
     } catch (error) {
@@ -178,201 +200,168 @@ class UniversalTranscriptionService {
     })
   }
 
-  async processWebMChunk(audioBlob: Blob) {
-    // Process WebM directly with different encoding configurations
-    const timestamp = this.getRelativeTimestamp()
+  async processWebMChunk(audioBlob: Blob, timestamp: string) {
     this.chunkCount++
-
     console.log(`Processing WebM chunk ${this.chunkCount} at ${timestamp}, size: ${audioBlob.size} bytes`)
     console.log(`Audio blob type: ${audioBlob.type}`)
 
+    // Add to buffer for context
+    this.audioBuffer.push(audioBlob)
+    
+    // Keep only last 3 chunks for context (prevents memory issues)
+    if (this.audioBuffer.length > 3) {
+      this.audioBuffer.shift()
+    }
+
+    // Process the current chunk with context from previous chunks
+    await this.processChunkWithContext(audioBlob, timestamp)
+  }
+
+  private async processChunkWithContext(audioBlob: Blob, timestamp: string) {
     try {
-      const apiKey = await storage.get("google_api_key")
+             const apiKey = await storage.get("google_api_key")
       if (!apiKey) {
         console.error('No API key available')
         return
       }
-      
+
       console.log('API key available, length:', apiKey.length)
       
-      // Convert blob to base64 for Google API
-      const audioBase64 = await this.blobToBase64(audioBlob)
-      const base64Data = audioBase64.split(',')[1] // Remove data URL prefix
-      
-      console.log(`Base64 data length: ${base64Data.length} characters`)
-      console.log(`First 100 chars of base64: ${base64Data.substring(0, 100)}...`)
-      
-      // Try different encoding configurations for WebM
-      const encodingConfigs = [
-        {
+      // Convert blob to base64
+      const base64Data = await this.blobToBase64(audioBlob)
+      console.log('Base64 data length:', base64Data.length, 'characters')
+      console.log('First 100 chars of base64:', base64Data.substring(0, 100))
+
+      // Use explicit configuration that works with WebM Opus:
+      // - encoding: WEBM_OPUS (what MediaRecorder produces)
+      // - sampleRateHertz: 48000 (WebM Opus standard)
+      // - audioChannelCount: 2 (stereo, matches MediaRecorder output)
+      // - Enhanced model for better video transcription
+      const requestBody = {
+        config: {
           encoding: 'WEBM_OPUS',
-          sampleRateHertz: 48000,
-          description: 'WebM with Opus codec, 48kHz'
+          sampleRateHertz: 48000, // Explicitly set to WebM Opus standard
+          audioChannelCount: 2,    // Explicitly set to stereo
+          enableSeparateRecognitionPerChannel: false,
+          languageCode: 'en-US',
+          enableAutomaticPunctuation: true,
+          model: 'video',
+          useEnhanced: true,       // Use enhanced model for video content
+          maxAlternatives: 1
         },
-        {
-          encoding: 'WEBM_OPUS',
-          sampleRateHertz: 44100,
-          description: 'WebM with Opus codec, 44.1kHz'
-        },
-        {
-          encoding: 'WEBM',
-          sampleRateHertz: 48000,
-          description: 'Generic WebM, 48kHz'
-        },
-        {
-          encoding: 'WEBM',
-          sampleRateHertz: 44100,
-          description: 'Generic WebM, 44.1kHz'
-        },
-        {
-          encoding: 'OGG_OPUS',
-          sampleRateHertz: 48000,
-          description: 'OGG with Opus codec, 48kHz'
-        },
-        {
-          encoding: 'MP3',
-          sampleRateHertz: 44100,
-          description: 'MP3, 44.1kHz'
-        }
-      ]
-      
-      let transcriptionSuccess = false
-      
-      for (const config of encodingConfigs) {
-        if (transcriptionSuccess) break
-        
-        console.log(`Trying ${config.description}...`)
-        
-        const requestBody = {
-          config: {
-            encoding: config.encoding,
-            sampleRateHertz: config.sampleRateHertz,
-            languageCode: 'en-US',
-            enableAutomaticPunctuation: true,
-            model: 'video',
-            useEnhanced: true,
-            maxAlternatives: 1
-          },
-          audio: {
-            content: base64Data
-          }
-        }
-
-        console.log(`Sending ${config.encoding} audio to Google Speech API...`)
-        console.log(`Request body config:`, requestBody.config)
-        
-        try {
-          const response = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(requestBody)
-          })
-
-          console.log(`Google Speech API response status: ${response.status}`)
-          console.log(`Response headers:`, Object.fromEntries(response.headers.entries()))
-
-          if (response.ok) {
-            const result = await response.json()
-            console.log('Google Speech API response for WebM:', result)
-            
-            if (result.results && result.results.length > 0 && result.results[0].alternatives) {
-              const transcription = result.results[0].alternatives[0].transcript
-              const confidence = result.results[0].alternatives[0].confidence || 0
-              
-              if (transcription && transcription.trim().length > 0) {
-                const entry: TranscriptionEntry = {
-                  timestamp,
-                  text: transcription.trim(),
-                  language: 'en-US',
-                  chunkNumber: this.chunkCount
-                }
-                
-                this.transcriptionData.push(entry)
-                console.log(`✅ WebM [${timestamp}] (confidence: ${confidence.toFixed(2)}): ${transcription}`)
-                
-                // Send message to popup about processed chunk
-                chrome.runtime.sendMessage({
-                  type: 'chunkProcessed',
-                  chunkNumber: this.chunkCount,
-                  language: 'en-US',
-                  text: transcription,
-                  confidence: confidence
-                })
-                
-                // Auto-save every 5 successful chunks
-                if (this.transcriptionData.length % 5 === 0) {
-                  await this.saveTranscriptionFile()
-                }
-                
-                transcriptionSuccess = true
-                break
-              } else {
-                console.log(`WebM Chunk ${this.chunkCount}: Empty transcription result`)
-              }
-            } else {
-              console.log(`❌ WebM Chunk ${this.chunkCount}: No transcription results`)
-              console.log('Full WebM API response for debugging:', JSON.stringify(result, null, 2))
-            }
-          } else {
-            const errorText = await response.text()
-            console.error(`Google Speech API error for ${config.encoding}:`, response.status, errorText)
-            
-            if (response.status === 400) {
-              console.log(`❌ Bad request for ${config.encoding} - check audio format or API configuration`)
-              try {
-                const errorJson = JSON.parse(errorText)
-                console.log('API Error details:', errorJson)
-              } catch (e) {
-                console.log('Could not parse error response')
-              }
-            }
-          }
-        } catch (fetchError) {
-          console.error(`Fetch error for ${config.encoding}:`, fetchError)
+        audio: {
+          content: base64Data
         }
       }
-      
-      if (!transcriptionSuccess) {
-        console.log(`❌ All encoding configurations failed for chunk ${this.chunkCount}`)
-        
-        // Try one more approach: send without specifying encoding (let Google auto-detect)
-        console.log('Trying auto-detection approach...')
-        try {
-          const requestBody = {
+
+      // If we're using Vorbis codec, adjust the configuration
+      if (audioBlob.type.includes('vorbis')) {
+        console.log('Detected Vorbis codec, using VORBIS encoding...')
+        requestBody.config.encoding = 'WEBM_VORBIS'
+        // Vorbis typically works better with auto-detection
+        delete requestBody.config.sampleRateHertz
+        delete requestBody.config.audioChannelCount
+      }
+
+      console.log('Sending audio to Google Speech API with config:', requestBody.config)
+      console.log('Audio data size:', audioBlob.size, 'bytes')
+      console.log('Audio data type:', audioBlob.type)
+
+      const response = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody)
+      })
+
+      console.log('Google Speech API response status:', response.status)
+      console.log('Response headers:', Object.fromEntries(response.headers.entries()))
+
+      if (response.ok) {
+        const result = await response.json()
+        console.log('Google Speech API response for WebM:', result)
+        console.log('Response details:')
+        console.log('- Status:', response.status)
+        console.log('- Results count:', result.results ? result.results.length : 'undefined')
+        console.log('- Total billed time:', result.totalBilledTime)
+        console.log('- Request ID:', result.requestId)
+
+        if (result.results && result.results.length > 0 && result.results[0].alternatives) {
+          const transcription = result.results[0].alternatives[0].transcript
+          const confidence = result.results[0].alternatives[0].confidence || 0
+
+          if (transcription && transcription.trim().length > 0) {
+            const entry: TranscriptionEntry = {
+              timestamp,
+              text: transcription.trim(),
+              language: 'en-US',
+              chunkNumber: this.chunkCount
+            }
+
+            this.transcriptionData.push(entry)
+            console.log(`✅ WebM [${timestamp}] (confidence: ${confidence.toFixed(2)}): ${transcription}`)
+
+            // Send message to popup about processed chunk
+            chrome.runtime.sendMessage({
+              type: 'chunkProcessed',
+              chunkNumber: this.chunkCount,
+              language: 'en-US',
+              text: transcription,
+              confidence: confidence
+            })
+
+            // Auto-save every 5 successful chunks
+            if (this.transcriptionData.length % 5 === 0) {
+              await this.saveTranscriptionFile()
+            }
+          } else {
+            console.log(`WebM Chunk ${this.chunkCount}: Empty transcription result`)
+            console.log('This suggests the API processed the audio but found no speech content')
+          }
+        } else {
+          console.log(`❌ WebM Chunk ${this.chunkCount}: No transcription results`)
+          console.log('Possible reasons:')
+          console.log('- Audio contains only background noise/music')
+          console.log('- Audio chunk is too short for reliable recognition')
+          console.log('- Audio format is not properly decoded by the API')
+          console.log('- Chunk boundaries cut through speech')
+          
+          if (result) {
+            console.log('Full WebM API response for debugging:', JSON.stringify(result, null, 2))
+          }
+
+          // If we get a 200 response but no results, try one more time without sample rate specification
+          console.log('Got 200 response but no results. Trying without sample rate specification...')
+          const noSampleRateBody = {
             config: {
+              encoding: 'WEBM_OPUS',
+              // No sampleRateHertz - let API infer from audio
+              audioChannelCount: 2,
+              enableSeparateRecognitionPerChannel: false,
               languageCode: 'en-US',
               enableAutomaticPunctuation: true,
               model: 'video',
               useEnhanced: true,
               maxAlternatives: 1
             },
-            audio: {
-              content: base64Data
-            }
+            audio: { content: base64Data }
           }
-          
-          console.log('Sending audio with auto-detection...')
-          
-          const response = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`, {
+
+          const noSampleRateResp = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`, {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(requestBody)
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(noSampleRateBody)
           })
-          
-          console.log(`Auto-detection response status: ${response.status}`)
-          
-          if (response.ok) {
-            const result = await response.json()
-            console.log('Auto-detection API response:', result)
-            
-            if (result.results && result.results.length > 0 && result.results[0].alternatives) {
-              const transcription = result.results[0].alternatives[0].transcript
-              const confidence = result.results[0].alternatives[0].confidence || 0
-              
+
+          console.log('No sample rate fallback status:', noSampleRateResp.status)
+          if (noSampleRateResp.ok) {
+            const noSampleRateResult = await noSampleRateResp.json()
+            console.log('No sample rate fallback response:', noSampleRateResult)
+
+            // Process the fallback result if it has transcription
+            if (noSampleRateResult.results && noSampleRateResult.results.length > 0 && noSampleRateResult.results[0].alternatives) {
+              const transcription = noSampleRateResult.results[0].alternatives[0].transcript
+              const confidence = noSampleRateResult.results[0].alternatives[0].confidence || 0
+
               if (transcription && transcription.trim().length > 0) {
                 const entry: TranscriptionEntry = {
                   timestamp,
@@ -380,10 +369,10 @@ class UniversalTranscriptionService {
                   language: 'en-US',
                   chunkNumber: this.chunkCount
                 }
-                
+
                 this.transcriptionData.push(entry)
-                console.log(`✅ Auto-detection [${timestamp}] (confidence: ${confidence.toFixed(2)}): ${transcription}`)
-                
+                console.log(`✅ WebM No-Sample-Rate Fallback [${timestamp}] (confidence: ${confidence.toFixed(2)}): ${transcription}`)
+
                 // Send message to popup about processed chunk
                 chrome.runtime.sendMessage({
                   type: 'chunkProcessed',
@@ -392,24 +381,115 @@ class UniversalTranscriptionService {
                   text: transcription,
                   confidence: confidence
                 })
-                
+
                 // Auto-save every 5 successful chunks
                 if (this.transcriptionData.length % 5 === 0) {
                   await this.saveTranscriptionFile()
                 }
-                
-                transcriptionSuccess = true
               }
             }
           } else {
-            const errorText = await response.text()
-            console.error('Auto-detection API error:', response.status, errorText)
+            console.log('No sample rate fallback failed:', await noSampleRateResp.text())
           }
-        } catch (error) {
-          console.error('Auto-detection approach failed:', error)
+        }
+      } else {
+        const errorText = await response.text()
+        console.error('Google Speech API error for WebM:', response.status, errorText)
+        console.log('Error analysis:')
+        console.log('- HTTP status:', response.status)
+        console.log('- Error message:', errorText)
+
+        // If we see a channel count complaint, try once more with channelCount unset.
+        if (errorText.includes('audio_channel_count')) {
+          console.log('Retrying without audioChannelCount to let API infer...')
+          const retryBody = {
+            config: {
+              encoding: 'WEBM_OPUS',
+              languageCode: 'en-US',
+              enableAutomaticPunctuation: true,
+              model: 'video',
+              useEnhanced: true,
+              maxAlternatives: 1
+            },
+            audio: { content: base64Data }
+          }
+          const retryResp = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(retryBody)
+          })
+          console.log('Retry status:', retryResp.status)
+          if (retryResp.ok) {
+            const retryResult = await retryResp.json()
+            console.log('Retry response:', retryResult)
+          } else {
+            console.log('Retry failed:', await retryResp.text())
+          }
+        }
+
+        // If we see a sample rate complaint, try with 44.1kHz as fallback
+        if (errorText.includes('sample rate') || errorText.includes('Opus sample rate')) {
+          console.log('Retrying with 44.1kHz sample rate as fallback...')
+          const fallbackBody = {
+            config: {
+              encoding: 'WEBM_OPUS',
+              sampleRateHertz: 44100, // Try 44.1kHz as fallback
+              audioChannelCount: 2,
+              enableSeparateRecognitionPerChannel: false,
+              languageCode: 'en-US',
+              enableAutomaticPunctuation: true,
+              model: 'video',
+              useEnhanced: true,
+              maxAlternatives: 1
+            },
+            audio: { content: base64Data }
+          }
+          const fallbackResp = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(fallbackBody)
+          })
+          console.log('Fallback status:', fallbackResp.status)
+          if (fallbackResp.ok) {
+            const fallbackResult = await fallbackResp.json()
+            console.log('Fallback response:', fallbackResult)
+
+            // Process the fallback result if it has transcription
+            if (fallbackResult.results && fallbackResult.results.length > 0 && fallbackResult.results[0].alternatives) {
+              const transcription = fallbackResult.results[0].alternatives[0].transcript
+              const confidence = fallbackResult.results[0].alternatives[0].confidence || 0
+
+              if (transcription && transcription.trim().length > 0) {
+                const entry: TranscriptionEntry = {
+                  timestamp,
+                  text: transcription.trim(),
+                  language: 'en-US',
+                  chunkNumber: this.chunkCount
+                }
+
+                this.transcriptionData.push(entry)
+                console.log(`✅ WebM Fallback [${timestamp}] (confidence: ${confidence.toFixed(2)}): ${transcription}`)
+
+                // Send message to popup about processed chunk
+                chrome.runtime.sendMessage({
+                  type: 'chunkProcessed',
+                  chunkNumber: this.chunkCount,
+                  language: 'en-US',
+                  text: transcription,
+                  confidence: confidence
+                })
+
+                // Auto-save every 5 successful chunks
+                if (this.transcriptionData.length % 5 === 0) {
+                  await this.saveTranscriptionFile()
+                }
+              }
+            }
+          } else {
+            console.log('Fallback failed:', await fallbackResp.text())
+          }
         }
       }
-      
     } catch (error) {
       console.error('Error processing WebM chunk:', error)
     }
@@ -455,10 +535,10 @@ class UniversalTranscriptionService {
     console.log('Auto transcription stopped')
   }
 
-  private getRelativeTimestamp(): string {
-    if (!this.sessionStartTime) return '00:00:00'
+  getRelativeTimestamp(): string {
+    if (!this.recordingStartTime) return '00:00:00'
     
-    const elapsed = Date.now() - this.sessionStartTime
+    const elapsed = Date.now() - this.recordingStartTime
     const seconds = Math.floor(elapsed / 1000)
     const minutes = Math.floor(seconds / 60)
     const hours = Math.floor(minutes / 60)
@@ -606,22 +686,22 @@ chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
         if (youtubeTabs.length > 0) {
           const youtubeTab = youtubeTabs[0]
           console.log(`Found ${youtubeTabs.length} YouTube tab(s), using:`, youtubeTab.id, youtubeTab.url)
-          
-          // Start the actual recording using tabCapture
+        
+        // Start the actual recording using tabCapture
           transcriptionService.startRecording(youtubeTab.id!)
-          
-          chrome.action.setBadgeText({ text: 'REC', tabId: youtubeTab.id })
-          
+        
+        chrome.action.setBadgeText({ text: 'REC', tabId: youtubeTab.id })
+        
           sendResponse({ 
             success: true, 
             isRecording: true, 
             message: `Recording started on YouTube tab: ${youtubeTab.title || 'YouTube'}` 
           })
-        } else {
-          const error = 'No YouTube tab found. Please open a YouTube video first.'
-          console.error(error)
-          sendResponse({ success: false, error })
-        }
+      } else {
+        const error = 'No YouTube tab found. Please open a YouTube video first.'
+        console.error(error)
+        sendResponse({ success: false, error })
+      }
       })
     })
     
@@ -667,7 +747,8 @@ chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
         console.log(`Created audio blob: ${audioBlob.size} bytes, type: ${audioBlob.type}`)
         
         // Process with WebM handling
-        transcriptionService.processWebMChunk(audioBlob)
+        const timestamp = transcriptionService.getRelativeTimestamp()
+        transcriptionService.processWebMChunk(audioBlob, timestamp)
         
       } catch (error) {
         console.error('Failed to process WebM_ORIGINAL audio data:', error)
@@ -685,7 +766,8 @@ chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
         const audioBlob = new Blob([bytes], { type: message.mimeType || 'audio/webm;codecs=opus' })
         
         // Process with original WebM handling
-        transcriptionService.processWebMChunk(audioBlob)
+        const timestamp = transcriptionService.getRelativeTimestamp()
+        transcriptionService.processWebMChunk(audioBlob, timestamp)
         
       } catch (error) {
         console.error('Failed to process WebM audio data:', error)

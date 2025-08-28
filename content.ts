@@ -127,14 +127,25 @@ async function startScreenCapture() {
     
     // Check what formats are supported
     const supportedTypes = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/webm;codecs=vorbis'
+      'audio/webm;codecs=vorbis',  // Try Vorbis first - often more compatible
+      'audio/webm;codecs=opus',    // Opus as fallback
+      'audio/webm'                  // Generic WebM as last resort
     ]
     
     let selectedType = supportedTypes.find(type => MediaRecorder.isTypeSupported(type))
     console.log('Supported audio types:', supportedTypes.map(type => `${type}: ${MediaRecorder.isTypeSupported(type) ? 'YES' : 'NO'}`))
     console.log('Selected audio type:', selectedType)
+    
+    // Force Vorbis if available for better Google Speech API compatibility
+    if (MediaRecorder.isTypeSupported('audio/webm;codecs=vorbis')) {
+      selectedType = 'audio/webm;codecs=vorbis'
+      console.log('✅ Forcing Vorbis codec for better Google Speech API compatibility')
+    } else if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+      selectedType = 'audio/webm;codecs=opus'
+      console.log('⚠️ Using Opus codec (may have compatibility issues)')
+    } else {
+      console.log('⚠️ Using generic WebM format (compatibility unknown)')
+    }
     
     const options: MediaRecorderOptions = {
       audioBitsPerSecond: 128000
@@ -161,6 +172,13 @@ async function startScreenCapture() {
         console.log(`Audio chunk available: ${event.data.size} bytes`)
         console.log(`Audio chunk type: ${event.data.type}`)
         console.log(`Audio chunk timestamp: ${event.timeStamp}`)
+        
+        // Analyze the audio data for patterns
+        console.log(`Audio chunk analysis:`)
+        console.log(`- Size: ${event.data.size} bytes`)
+        console.log(`- Type: ${event.data.type}`)
+        console.log(`- Timestamp: ${event.timeStamp}`)
+        console.log(`- Duration estimate: ${(event.data.size / 128000 * 8).toFixed(2)} seconds (based on 128kbps)`)
         
         try {
           // Don't try to convert to LINEAR16 - just send the original WebM data
@@ -225,9 +243,10 @@ async function startScreenCapture() {
       console.log('✅ MediaRecorder started successfully')
     }
     
-    // Start recording in 10-second chunks
-    console.log('🎬 Starting MediaRecorder with 10-second chunks...')
-    mediaRecorder.start(10000)
+    // Start recording with overlapping chunks to prevent speech cutoff
+    // Use 30-second chunks with 5-second overlap for better transcription
+    console.log('🎬 Starting MediaRecorder with 30-second overlapping chunks...')
+    mediaRecorder.start(25000) // 25 seconds + 5 second overlap buffer
     console.log('✅ MediaRecorder.start() called')
     
     audioStream = stream
